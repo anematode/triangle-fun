@@ -1,0 +1,19 @@
+{
+  "name": "triangle-heaven",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "enjoy": "npx esbuild index.ts --watch --serve --servedir=. --outfile=index.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.2"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.47"
+  }
+}
