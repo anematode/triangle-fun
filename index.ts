@@ -6,7 +6,10 @@ document.body.appendChild(canvas);
 
 const adapter = await navigator.gpu.requestAdapter();
 const device = await adapter.requestDevice({
-    requiredFeatures: ['shader-f16']
+    requiredFeatures: ['shader-f16'],
+    requiredLimits: {
+        maxBufferSize: (1 << 31) >>> 0
+    }
 });
 
 const UNEXPANDED_CHROMO_STRIDE = 10;
@@ -43,19 +46,23 @@ function clamp(x: number, min: number, max: number) {
 }
 
 const PROBABILITY_TO_PERTURB_COORDINATE = 0.25;
-const PROBABILITY_TO_PERTURB_COLOUR = 0.25;
+const PROBABILITY_TO_PERTURB_COLOUR = 0.5;
 
-function mutateChromo1(tri: Float32Array, perturbation: number) {
+function rand() {
+    return 2 * Math.random() - 1;
+}
+
+function mutateChromo1(tri: Float32Array, perturbation: number, colorPerturb: number) {
     for (let i = 0; i < tri.length; i += UNEXPANDED_CHROMO_STRIDE) {
         for (let j = 0; j < 6; j++) {
             if (Math.random() < PROBABILITY_TO_PERTURB_COORDINATE) {
-                tri[i + j] = clamp(tri[i + j] + 2 * (Math.random() - 0.5) * perturbation, 0, 1);
+                tri[i + j] = clamp(tri[i + j] + rand() / perturbation, 0, 1);
             }
         }
 
         for (let j = 6; j < 9 /* exclude alpha channel */; j++) {
             if (Math.random() < PROBABILITY_TO_PERTURB_COLOUR) {
-                tri[i + j] = clamp(tri[i + j] + (Math.random() - 0.5) * perturbation, 0, 1);
+                tri[i + j] = clamp(tri[i + j] + rand() / colorPerturb, 0, 1);
             }
         }
     }
@@ -110,7 +117,7 @@ struct Uniforms {
     @builtin(vertex_index) vertexIndex: u32,
     v: ChromoVertex
 ) -> VsOutput {
-    let draw_index = vertexIndex / (3 * uniforms.trianglesPerChromo);
+    let draw_index = (vertexIndex / (3 * uniforms.trianglesPerChromo)) % (uniforms.m * uniforms.n);
     
     let draw_index_y = draw_index / uniforms.m;
     let draw_index_x = draw_index - draw_index_y * uniforms.m;
@@ -168,8 +175,7 @@ struct Uniforms {
             let approx = textureLoad(rasterised, vec2<i32>(x * dx + i, y * dy + j), 0);
             
             let delta = target_ - approx;
-            
-            fitness += dot(delta, delta);
+            fitness += length(delta);
         }
     }
     
@@ -183,6 +189,7 @@ type InstanceBuffers = {
     //    float4 color;
     // } chromos[POP_SIZE * TRIANGLE_COUNT];
     chromos: GPUBuffer;
+    chromosUpload: GPUBuffer;
 
     // Uniforms for the draw pass
     // struct {
@@ -243,6 +250,8 @@ function parseFloat16(u16: number) {
     return sign === 0 ? mantissa : -mantissa;
 }
 
+let isFirst = true;
+
 class Instance {
     ctx: CanvasRenderingContext2D;
 
@@ -256,6 +265,11 @@ class Instance {
     module: GPUShaderModule;
     pipeline: GPURenderPipeline;
     private targetDims: [number, number];
+    private commandBuffer: GPUCommandBuffer;
+    private computeBindGroup: GPUBindGroup;
+    private computePipeline: GPUComputePipeline;
+    private renderPassDescriptor: GPURenderPassDescriptor;
+    private renderBindGroup: GPUBindGroup;
 
     async downloadIntermediateTexture(): Promise<ImageData> {
         const texture = this.buffers.renderTarget;
@@ -308,6 +322,25 @@ class Instance {
         ctx.putImageData(downloaded, 0, 0);
     }
 
+    async uploadChromos() {
+        const POX = this.options.trianglesPerChromo * UNEXPANDED_CHROMO_STRIDE;
+
+        if (isFirst) {
+            /*this.generation.subarray(103 * POX, 104 * POX).set([
+                1, 0, 0, 1, 0, 0, 221 / 255, 238 / 255, 1, 1
+            ])*/
+        }
+        isFirst = false;
+
+
+        expandTriangles(this.generation, this.expanded);
+        const { chromosUpload } = this.buffers;
+
+        await chromosUpload.mapAsync(GPUMapMode.WRITE);
+        new Float32Array(chromosUpload.getMappedRange()).set(this.expanded);
+        chromosUpload.unmap();
+    }
+
     constructor(readonly canvas: HTMLCanvasElement, readonly options: InstanceOptions) {
         this.ctx = canvas.getContext('2d');
         this.buffers = {} as any;
@@ -318,7 +351,7 @@ class Instance {
         const img = options.targetImage;
 
         // Optimise for this to be the side length of the rendered-to texture
-        const GOAL_DIM = 2048;
+        const GOAL_DIM = 4096;
         this.M = options.forceBatch?.[0] ?? Math.floor(GOAL_DIM / img.width);
         this.N = options.forceBatch?.[1] ?? Math.floor(GOAL_DIM / img.height);
 
@@ -403,7 +436,7 @@ class Instance {
             },
         });
 
-        const renderPassDescriptor: GPURenderPassDescriptor = {
+        const renderPassDescriptor: GPURenderPassDescriptor = this.renderPassDescriptor = {
             label: 'our basic canvas renderPass',
             colorAttachments: [
                 {
@@ -422,12 +455,14 @@ class Instance {
         const chromos = device.createBuffer({
             label: 'chromos',
             size: this.expanded.byteLength,
-            usage: GPUBufferUsage.VERTEX,
-            mappedAtCreation: true,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
         });
 
-        new Float32Array(chromos.getMappedRange()).set(this.expanded);
-        chromos.unmap();
+        this.buffers.chromosUpload = device.createBuffer({
+            label: 'chromos upload',
+            size: this.expanded.byteLength,
+            usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.MAP_WRITE,
+        });
 
         const drawUniforms = device.createBuffer({
             label: 'draw uniforms',
@@ -435,7 +470,7 @@ class Instance {
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
-        const bindGroup = device.createBindGroup({
+        const bindGroup = this.renderBindGroup = device.createBindGroup({
             label: 'draw bind group',
             layout: pipeline.getBindGroupLayout(0),
             entries: [
@@ -453,15 +488,7 @@ class Instance {
             ])
         );
 
-        // make a render pass encoder to encode render specific commands
-        const pass = encoder.beginRenderPass(renderPassDescriptor);
-        pass.setPipeline(pipeline);
-        pass.setVertexBuffer(0, chromos);
-        pass.setBindGroup(0, bindGroup);
-        pass.draw(options.popSize * options.trianglesPerChromo * 3);  // call our vertex shader 3 times
-        pass.end();
-
-        const computePipeline = device.createComputePipeline({
+        const computePipeline = this.computePipeline = device.createComputePipeline({
             label: 'fitness',
             compute: {
                 module: device.createShaderModule({
@@ -483,20 +510,16 @@ class Instance {
         });
         this.buffers.computeUniforms = computeUniforms;
 
-        const computeBindGroup = device.createBindGroup({
+        const computeBindGroup = this.computeBindGroup = device.createBindGroup({
             label: 'compute bind group',
             layout: computePipeline.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: { buffer: this.buffers.computeUniforms }},
-                { binding: 1, resource: this.buffers.goalImage.createView() },
-                { binding: 2, resource: this.buffers.renderTarget.createView() },
-                { binding: 3, resource: { buffer: this.buffers.fitness, offset: 0 }},
+                {binding: 0, resource: {buffer: this.buffers.computeUniforms}},
+                {binding: 1, resource: this.buffers.goalImage.createView()},
+                {binding: 2, resource: this.buffers.renderTarget.createView()},
+                {binding: 3, resource: {buffer: this.buffers.fitness, offset: 0}},
             ],
         });
-
-        const computePass = encoder.beginComputePass({ label: "compute" });
-        computePass.setPipeline(computePipeline);
-        computePass.setBindGroup(0, computeBindGroup);
 
         device.queue.writeBuffer(
             computeUniforms,
@@ -507,26 +530,115 @@ class Instance {
             ])
         );
 
-        computePass.dispatchWorkgroups(this.M, this.N);
-        computePass.end();
 
-        encoder.copyBufferToBuffer(this.buffers.fitness, 0, this.buffers.fitnessReader, 0, options.popSize * 4);
+        this.reallyEnjoy();
+    }
 
-        const commandBuffer = encoder.finish();
-        device.queue.submit([commandBuffer]);
+    async reallyEnjoy() {
+        console.time("cow");
+        for (let i = 0; i < 30000; ++i) {
+            console.log("HELLO", i);
+            await this.enjoy();
 
-        (async() => {
-            const f = this.buffers.fitnessReader;
-            await f.mapAsync(GPUMapMode.READ);
-            const fitnesses = new Float32Array(f.getMappedRange()).slice();
+            if (i % 100 === 0) {
+                await this.enjoy(true);
+                await this.showIntermediate();
+            }
+        }
+        console.timeEnd("cow");
 
-            console.log({ fitnesses });
+        await this.enjoy(true);
 
-            f.unmap();
-        })();
+    }
 
+    async enjoy(showBest = false) {
+        await this.uploadChromos();
+        const encoder = device.createCommandEncoder();
 
-        this.showIntermediate();
+        const { options, buffers, pipeline, renderBindGroup } = this;
+        const { chromos}  = buffers;
+
+        encoder.copyBufferToBuffer(this.buffers.chromosUpload, 0, chromos, 0, this.expanded.byteLength);
+
+        for (let i = 0; i < options.popSize; i += this.M * this.N) {
+            const count = Math.min(options.popSize - i, this.M * this.N);
+
+            const pass = encoder.beginRenderPass(this.renderPassDescriptor);
+            pass.setPipeline(pipeline);
+            pass.setVertexBuffer(0, chromos);
+            pass.setBindGroup(0, renderBindGroup);
+            pass.draw(count * options.trianglesPerChromo * 3, 1, i * options.trianglesPerChromo * 3);  // call our vertex shader 3 times
+            pass.end();
+
+            const computePass = encoder.beginComputePass({label: "compute"});
+            computePass.setPipeline(this.computePipeline);
+            computePass.setBindGroup(0, this.computeBindGroup);
+            computePass.dispatchWorkgroups(this.M, this.N);
+            computePass.end();
+
+            encoder.copyBufferToBuffer(this.buffers.fitness, 0, this.buffers.fitnessReader, i * 4, count * 4);
+
+            if (showBest) break;
+        }
+
+        device.queue.submit([encoder.finish()]);
+        if (showBest) return;
+
+        const f = this.buffers.fitnessReader;
+        await f.mapAsync(GPUMapMode.READ);
+        const fitnesses = new Float32Array(f.getMappedRange()).slice();
+
+        //console.log({ fitnesses });
+
+        f.unmap();
+
+        this.updateUsingFitnesses(fitnesses);
+    }
+
+    updateUsingFitnesses(fitnesses: Float32Array) {
+        const options = this.options;
+
+        const indices = new Array(options.popSize).fill(0).map((_, i) => i);
+        indices.sort((a, b) => fitnesses[a] - fitnesses[b]);
+
+        const POX = options.trianglesPerChromo * UNEXPANDED_CHROMO_STRIDE;
+
+        //console.log("GOOD:", indices[0], this.generation.subarray(indices[0] * POX, (indices[0] + 1) * POX))
+
+        const neue = new Float32Array(this.generation.length);
+        for (let i = 0; i < options.popSize; i++) {
+            neue.set(this.generation.subarray(indices[i] * POX, (indices[i] + 1) * POX), i * POX);
+        }
+
+        this.generation.set(neue);
+
+        const CROSSOVER_PROBABILITY = 0.5;
+        const PERTURBATION = 0.05;
+
+        const discard = Math.floor(options.popSize * 0.75);
+        const keep = options.popSize - discard;
+
+        for (let i = keep; i < options.popSize; ++i) {
+            if (Math.random() < CROSSOVER_PROBABILITY) {
+                const j = Math.random() * keep | 0;
+                const k = Math.random() * keep | 0;
+
+                (Math.random() < 0.5 ? crossover1p : crossoverRandom)(
+                    this.generation.subarray(j * POX, (j + 1) * POX),
+                    this.generation.subarray(k * POX, (k + 1) * POX),
+                    this.generation.subarray(i * POX, (i + 1) * POX),
+                    options.trianglesPerChromo
+                );
+            } else {
+                if (Math.random() < 0.95) {
+                    const j = Math.random() * keep | 0;
+                    this.generation.subarray(i * POX, (i + 1) * POX).set(this.generation.subarray(j * POX, (j + 1) * POX));
+                    mutateChromo1(this.generation.subarray(i * POX, (i + 1) * POX), rand() ** 2 * 500, rand() ** 2 * 500);
+                } else {
+                    fillWithRandomTriangles(this.generation.subarray(i * POX, (i + 1) * POX), options.triangleAlpha);
+                }
+            }
+        }
     }
 }
 
@@ -545,9 +657,9 @@ const img = new Promise<ImageData>((resolve, reject) => {
 });
 
 new Instance(canvas, {
-    triangleAlpha: 0.35,
-    popSize: 50,
-    trianglesPerChromo: 50,
+    triangleAlpha: 0.15,
+    popSize: 100,
+    trianglesPerChromo: 150,
     targetImage: await img,
-    backgroundColor: [0.5, 0.5, 0.5, 1.0]
+    backgroundColor: [0.0, 0.0, 0.0, 1.0]
 });
