@@ -2,7 +2,7 @@ const canvas = document.createElement("canvas");
 document.body.appendChild(canvas);
 const adapter = await navigator.gpu.requestAdapter();
 const device = await adapter.requestDevice({
-  requiredFeatures: ["shader-f16"],
+  requiredFeatures: [],
   requiredLimits: {
     maxBufferSize: 1 << 31 >>> 0
   }
@@ -133,11 +133,15 @@ struct Uniforms {
 @group(0) @binding(2) var rasterised: texture_2d<f32>;
 @group(0) @binding(3) var<storage, read_write> fitnesses: array<f32>;
 
-@compute @workgroup_size(1) fn main(
+@compute @workgroup_size(8, 8) fn main(
     @builtin(global_invocation_id) globalInvocationID: vec3<u32>
 ) {
     let x = i32(globalInvocationID.x);
     let y = i32(uniforms.n - globalInvocationID.y - 1);  // flip around
+    
+    if (x >= i32(uniforms.m) || y >= i32(uniforms.n)) {
+        return;
+    }
     
     let dx = i32(uniforms.targetWidth);
     let dy = i32(uniforms.targetHeight);
@@ -408,15 +412,13 @@ class Instance {
   }
   async reallyEnjoy() {
     console.time("cow");
-    for (let i = 0; i < 3e4; ++i) {
+    for (let i = 0; i < 100; ++i) {
       console.log("HELLO", i);
       await this.enjoy();
-      if (i % 100 === 0) {
-        await this.enjoy(true);
-        await this.showIntermediate();
-      }
     }
     console.timeEnd("cow");
+    await this.enjoy(true);
+    await this.showIntermediate();
     await this.enjoy(true);
   }
   async enjoy(showBest = false) {
@@ -436,7 +438,7 @@ class Instance {
       const computePass = encoder.beginComputePass({ label: "compute" });
       computePass.setPipeline(this.computePipeline);
       computePass.setBindGroup(0, this.computeBindGroup);
-      computePass.dispatchWorkgroups(this.M, this.N);
+      computePass.dispatchWorkgroups(this.M + 7 >> 3, this.N + 7 >> 3);
       computePass.end();
       encoder.copyBufferToBuffer(this.buffers.fitness, 0, this.buffers.fitnessReader, i * 4, count * 4);
       if (showBest) break;
@@ -499,7 +501,7 @@ const img = new Promise((resolve, reject) => {
 });
 new Instance(canvas, {
   triangleAlpha: 0.15,
-  popSize: 100,
+  popSize: 1e3,
   trianglesPerChromo: 150,
   targetImage: await img,
   backgroundColor: [0, 0, 0, 1]
